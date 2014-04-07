@@ -1,0 +1,40 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+
+use JSON::XS;
+use File::Slurp;
+use Term::ANSIColor;
+
+my $STATE_FILE_PATH = '/var/run/clientha/state';
+
+##############################################################################################
+
+# exit if there is no state file
+exit 0 unless ( -f $STATE_FILE_PATH );
+
+my $state = decode_json(read_file($STATE_FILE_PATH));
+
+if(keys %$state) {
+    print "\n";
+    printf("%27s  ->  %-17s\n",'HOST','IP');
+    printf("%27s------%-17s\n",'--------','--------');
+    
+    foreach my $host (sort keys %$state) {
+        my $level = "\U$state->{$host}{level}";
+        my $lvl_c = $ENV{NOCOLORS}   ? $level :
+                    $level eq 'OK'   ? colored($level,'green') :
+                    $level eq 'WARN' ? colored($level,'yellow') :
+                    colored($level,'red');
+        
+        printf("%27s  ->  %-17s [%s]", $host, $state->{$host}{ip}//q(), $lvl_c);
+        
+        if($level eq 'OK') {
+            print "\n";
+        }
+        else {
+            print " $state->{$host}{msg}\n";
+        }
+    }
+}

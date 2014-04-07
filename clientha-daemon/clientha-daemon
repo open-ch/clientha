@@ -1,0 +1,492 @@
+#!/bin/perl -w
+
+################################################################################
+#
+# Daemon to generate input files for libnss_clientha.so.2
+#
+# Written by Jan Bernegger jab@open.ch, November 2013
+# Copyright (c) 2013 Open Systems AG, Switzerland
+# All Rights Reserved.
+#
+# LICENSE:
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU Lesser General Public License as published by the
+# Free Software Foundation, either version 2.1 of the License, or (at your
+# option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License
+# for more details.
+#
+################################################################################
+
+use strict;
+use warnings;
+
+use lib '/opt/OSAGrrdfw/lib';
+
+use Net::Server::Daemonize qw(daemonize);
+use YAML::XS qw(LoadFile);
+use JSON::XS;
+use Fcntl qw(:flock);
+use Digest::MD5 qw(md5_hex);
+use File::Basename;
+use Fcntl qw( :flock );
+use Try::Tiny;
+use Getopt::Long;
+use Log::Any qw($log);
+use Log::Any::OSAG;
+
+# config
+my $PID_FILE        = '/var/run/clientha-daemon.pid';
+my $CONF_FILES_PATH = '/opt/OSAGclientha/etc';
+my $NAMES_OUT_PATH  = '/var/run/clientha/names';
+my $STATE_FILE_PATH = '/var/run/clientha/state';
+
+my $SLEEP_DAEMON            = 60;       # sleep time between each run
+my $MAX_FALLBACK_NOTICE_AGE = 3600;     # max age of last fallback notice
+
+# rrt must be smaller than the right term for @nearest_ips
+# $rrt < $min_rrt * $MIN_RTT_FACTOR + $MIN_RTT
+my $MIN_RTT         = 20;
+my $MIN_RTT_FACTOR  = 1.2;
+my $STATE_TRANS_LIM = 3;        # number of consecutive runs before switching IP
+
+# pingmachine conf
+my $ORDERS_DIR  = '/shared/work/OSAGping/orders';
+my $OUTPUT_BASE = '/shared/work/OSAGping/output';
+my $PINGM_STEP  = 60;           # write results every $PINGM_STEP interval
+my $PINGM_PINGS = 5;            # number of pings to issue
+
+# Option handling
+my %opts = ();
+GetOptions( \%opts,
+    'debug!',
+    'help|h' => \&usage,
+) || usage();
+
+# configure logger
+Log::Any::OSAG->configure(
+    level => $opts{debug} ? 'debug' : 'info',
+    screen => $opts{debug} ? 1 : 0,
+    syslog => $opts{debug} ? 0 : 1,
+);
+
+# global variable
+my $running;
+
+# main
+sub main {
+    daemonize('daemon', 'daemon', $PID_FILE) unless $opts{debug};
+
+    # install SIGTERM watcher
+    $running = 1;
+    $SIG{TERM} = sub { $running = 0 };
+
+    daemon_loop();
+}
+
+# daemon_loop
+sub daemon_loop {
+    my %state;
+
+    my @clientha_configs = get_clientha_configs(\%state);
+    if( @clientha_configs < 1 ) {
+        $log->error("daemon started without config");
+        exit -1;
+    }
+    
+    delete_old_ip_files(\@clientha_configs);
+    
+    while ($running) {
+        try {
+            # process each config file
+            foreach my $clientha_config (@clientha_configs) {
+                my $host = $clientha_config->{host};
+                $log->debug("processing $host");
+
+                # write pingmachine orders and read the results
+                my $pingm_out_dirs      = write_pingmachine_orders($clientha_config->{ip});
+                my $pingmachine_results = get_pingmachine_results($pingm_out_dirs);
+
+                # clear old error message before evaluating this run (MON-430)
+                delete $state{$host}{level} if exists $state{$host}{level};
+                delete $state{$host}{msg  } if exists $state{$host}{msg};
+
+                # go to next host if there are no results yet
+                if(keys %$pingmachine_results < 1) {
+                    my $ip;
+                    if($clientha_config->{fallback_ip}) {
+                        $ip = get_random_element($clientha_config->{fallback_ip});
+                        
+                        if( ( $state{$host}{last_fallback_notice}//0 ) < time + $MAX_FALLBACK_NOTICE_AGE ) {
+                            $log->info("Selected fallback IP $ip for host $host");
+                            $state{$host}{last_fallback_notice} = time;
+                        }
+                    }
+                    if($ip) {
+                        $state{$host}{selected_ip}      = $ip;
+                        $state{$host}{selected_ip_type} = 'fallback';
+                        $state{$host}{level}            = 'err';
+                        $state{$host}{msg}              = "No ping results for $host, chosing fallback $ip";
+                    }
+                    
+                    write_selected_ip_file($host, $ip);
+                    next;
+                }
+
+                # filter and select nearest_ip
+                my @nearest_ips = get_nearest_ips($pingmachine_results);
+                $state{$host}   = select_best_ip_for_state($host, $state{$host}, \@nearest_ips,
+                                                           $clientha_config->{ip_pinning}, $clientha_config->{fallback_ip});
+                
+                # write selected IP into file
+                write_selected_ip_file($host, $state{$host}{selected_ip});
+            }
+        }
+        catch {
+            $log->error($_);
+        };
+        try {
+            write_state(\%state);
+        } catch {
+            $log->error($_);
+        };
+        sleep $SLEEP_DAEMON;
+    }
+}
+
+# writes daemon state to file
+sub write_state {
+    my $state = shift;
+    
+    my %write_state;
+    while(my($host,$data) = each %$state) {
+        if( !defined $data->{level} ) {
+            my $type = $data->{selected_ip_type};
+            my $ip   = $data->{selected_ip};
+        
+            my $level;
+            if( $type eq 'fallback' ) {
+                $level = 'warn';
+            }
+            else {
+                $level = 'ok';
+            }
+            $write_state{$host} = {
+                level => $level,
+                ip    => $ip,
+                msg   => "$type IP $ip selected",
+            }
+        }
+        else {
+            $write_state{$host} = {
+                level => $data->{level},
+                ip    => $data->{selected_ip},
+                msg   => $data->{msg},
+            };
+        }
+    }
+    
+    if(open(my $fd, '>', $STATE_FILE_PATH)) {
+        flock($fd, LOCK_EX);
+        print $fd encode_json(\%write_state);
+        close $fd;
+    }
+    else {
+        die "Cannot write to state file $STATE_FILE_PATH";
+    }
+}
+
+# gets a random element of an array
+sub get_random_element {
+    my $arr = shift;
+    return $arr->[int(rand(@$arr))];
+}
+
+# read and parse *.conf files
+sub get_clientha_configs {
+    my $state = shift;
+    
+    my @nss_configs = ();
+    foreach my $file (glob("$CONF_FILES_PATH/*.conf")) {
+        try {
+            my $file_cfg = LoadFile($file);
+            die "no host or IPs defined" unless defined $file_cfg->{host} && defined $file_cfg->{ip};
+            
+            push(@nss_configs, $file_cfg) if $file_cfg;
+        }
+        catch {
+            my $err = $_;
+            if(/(YAML::XS::Load Error)/) {
+                $err = $1;
+            }
+            if($file =~ m#(?:.*/)*(.+?)#) {
+                $state->{$1} = {
+                    level => 'err',
+                    msg   => "Could not parse config $file: $err",
+                };
+            }
+        };
+    }
+    $log->debug(sprintf("%d configs found",scalar(@nss_configs)));
+
+    return @nss_configs;
+}
+
+# deletes all old, unused ip_files
+sub delete_old_ip_files {
+    my $clientha_configs = shift;
+
+    # get all ip_files
+    opendir(my $dh, $NAMES_OUT_PATH) || return;
+    my @ip_files = grep { !/^\./ } readdir($dh);
+
+    # get the difference between @ip_files and @$clientha_configs
+    my %configs      = map{ $_->{host} => 1 } @$clientha_configs;
+    my @old_ip_files = grep { !defined $configs{$_} } @ip_files;
+
+    foreach my $old_ip_file (@old_ip_files) {
+        unlink("$NAMES_OUT_PATH/$old_ip_file") or die "Could not unlink $NAMES_OUT_PATH/$old_ip_file: $!";
+        $log->info("removed ip file for $old_ip_file");
+    }
+}
+
+
+# write pingmachine orders and returns a hash ref { {IP => DIR}, ... }
+sub write_pingmachine_orders {
+    my $ips = shift;
+
+    my %pingm_out_dirs = ();
+    # write pingmachine orders
+    foreach my $ip (@$ips) {
+        $pingm_out_dirs{$ip} = write_order($ip);
+        $log->debug("$ip pingmachine order: ".basename $pingm_out_dirs{$ip});
+    }
+
+    return \%pingm_out_dirs;
+}
+
+# gets the results out of the given pingmachine output dirs
+sub get_pingmachine_results {
+    my $pingm_out_dirs = shift;
+
+    my %pingmachine_results = ();
+    # get data in last_result file for each pingmachine order
+    while(my($ip,$out_dir) = each %$pingm_out_dirs) {
+        my $update_file = "$out_dir/last_result";
+        next unless -f $update_file;
+
+        eval {
+            my $results = LoadFile($update_file);
+    
+            if($results && $results->{median}) {
+                $pingmachine_results{$ip} = $results->{median};
+                $log->debug("$ip result: $pingmachine_results{$ip}ms");
+            }
+        };
+    }
+
+    return \%pingmachine_results;
+}
+
+# filters the results and gets the nearest ips
+sub get_nearest_ips {
+    my %pingmachine_results = %{ shift() };
+    
+    # sort IPs by RRT
+    my @sorted_ips = sort {$pingmachine_results{$a} cmp $pingmachine_results{$b} }
+        keys %pingmachine_results;
+
+    my @nearest_ips = ();
+    # filter IPs
+    my $min_rrt = $pingmachine_results{$sorted_ips[0]};
+    foreach my $ip (@sorted_ips) {
+        last if $pingmachine_results{$ip} > $min_rrt*$MIN_RTT_FACTOR + $MIN_RTT;
+        push(@nearest_ips,$ip);
+    }
+
+    return @nearest_ips;
+}
+
+# runs the state machine or selects a random ip
+sub select_best_ip_for_state {
+    my $host         = shift;
+    my $host_state   = shift;
+    my @nearest_ips  = @{ shift() };
+    my $ip_pinning   = shift;
+    my $fallback_ips = shift;
+
+    # no nearest_ip could be found -> delete state and selected ip
+    if(@nearest_ips<1) {
+        # select a random fallback_ip
+        if( @$fallback_ips ) {
+            my $ip = get_random_element($fallback_ips);
+            $host_state->{selected_ip}      = $ip;
+            $host_state->{selected_ip_type} = 'fallback';
+            
+            if( ( $host_state->{last_fallback_notice}//0 ) < time + $MAX_FALLBACK_NOTICE_AGE ) {
+                $log->info("Selected fallback IP $ip for host $host") unless $ip eq $host_state->{selected_ip};
+                $host_state->{last_fallback_notice} = time;
+            }
+        }
+        else {
+            delete $host_state->{selected_ip};
+            delete $host_state->{selected_ip_type};
+            
+            $host_state->{level} = 'err';
+            $host_state->{msg}   = "no ip could be found for host $host";
+        }
+        delete $host_state->{state};
+        delete $host_state->{next_ip};
+        delete $host_state->{next_ips};
+        return $host_state;
+    }
+
+    # IP not reachable or no ip selected -> change immediately
+    if( !defined $host_state->{selected_ip} ) {
+        $host_state->{selected_ip}      = get_random_element(\@nearest_ips);
+        $host_state->{selected_ip_type} = 'random';
+        $log->info(sprintf('Selected IP %s for host %s',$host_state->{selected_ip},$host));
+        return $host_state;
+    }
+
+    if($ip_pinning) {
+        $host_state = run_state_machine($host, $host_state, \@nearest_ips, $fallback_ips);
+        $host_state->{selected_ip_type} = 'pinned';
+    }
+    else {
+        $host_state = select_random_ip($host, $host_state, \@nearest_ips);
+        $host_state->{selected_ip_type} = 'random';
+    }
+
+    return $host_state;
+}
+
+# runs the state machine and writes results into $host_state
+sub run_state_machine {
+    my $host         = shift;
+    my $host_state   = shift;
+    my $nearest_ips  = shift;
+    my $fallback_ips = shift;
+
+    # stay with IP if still in nearest_ips array
+    if( grep {$_ eq $host_state->{selected_ip}} @$nearest_ips ) {
+        delete $host_state->{state} if exists $host_state->{state};
+    }
+    else {
+        # state transition in progress
+        if(exists $host_state->{state}) {
+            # intersect old next_ips with nearest_ips
+            my @next_ips = grep( @{$host_state->{next_ips}}->{$_}, @$nearest_ips );
+            $host_state->{next_ips} = \@next_ips;
+
+            # no steady nearest ip can be found -> deactivate clientha for this host
+            if(@next_ips < 1) {
+                if(@$fallback_ips) {
+                    $host_state->{selected_ip} = get_random_element($fallback_ips);
+                    $log->info(sprintf("No nearest IP for %s could be found, using fallback IP %s",$host,$host_state->{selected_ip}));
+                }
+                else {
+                    delete $host_state->{selected_ip};
+                    $log->info("No nearest IP for $host could be found");
+                }
+                delete $host_state->{state};
+                delete $host_state->{next_ip};
+                delete $host_state->{next_ips};
+            }
+            else {
+                # if old next_ip is not in the intersection, chose another one which is
+                unless( grep( { $_ eq $host_state->{next_ip} } @next_ips ) ) {
+                    $host_state->{next_ip}  = get_random_element(\@next_ips);
+                }
+
+                # state transition limit has been reached
+                if($host_state->{state} == $STATE_TRANS_LIM-1) {
+                    $host_state->{selected_ip} = $host_state->{next_ip};
+                    delete $host_state->{state};
+                    delete $host_state->{next_ip};
+                    delete $host_state->{next_ips};
+                    $log->info(sprintf('Selected new IP %s for host %s',$host_state->{selected_ip},$host));
+                }
+                $host_state->{state} += 1;
+                $log->debug(sprintf('next_ip %s for host %s, state %d/%d',
+                    $host_state->{next_ip},$host,$host_state->{state},$STATE_TRANS_LIM));
+            }
+        }
+        # start state transition
+        else {
+            $host_state->{state}    = 1;
+            $host_state->{next_ips} = $nearest_ips;
+            $host_state->{next_ip}  = get_random_element($nearest_ips);
+            $log->debug(sprintf('next_ip %s for host %s, state %d/%d',
+                $host_state->{next_ip},$host,$host_state->{state},$STATE_TRANS_LIM));
+        }
+    }
+
+    return $host_state;
+}
+
+# selects random IP for $host_state
+sub select_random_ip {
+    my $host        = shift;
+    my $host_state  = shift;
+    my $nearest_ips = shift;
+
+    $host_state->{selected_ip} = get_random_element($nearest_ips);
+    $log->debug(sprintf('Selected IP %s for host %s',$host_state->{selected_ip},$host));
+
+    return $host_state;
+}
+
+# writes selected ip into clientha file which is parsed by libnss_clientha.so.2
+sub write_selected_ip_file {
+    my $host  = shift;
+    my $ip    = shift // q();
+    
+    my $file = "$NAMES_OUT_PATH/$host";
+
+    # flock file and write output
+    open(my $fd, '>', $file) or die "cannot write to $file";
+    flock($fd, LOCK_EX) or die "Cannot lock $file: $!";
+    print $fd $ip;
+    flock($fd, LOCK_UN);
+    close($fd);
+}
+
+# writes an order to pingmachine
+sub write_order {
+    my $ping_ip = shift;
+
+    # Write order file
+    my $order = <<END;
+user: clientha
+task: $ping_ip
+step: $PINGM_STEP
+pings: $PINGM_PINGS
+probe: fping
+fping:
+    host: $ping_ip
+END
+    my $order_id = md5_hex($order);
+    my $order_file = $ORDERS_DIR . "/$order_id";
+    open(my $fh, '>', $order_file) or
+        die "ERROR: can't write $order_file: $!\n";
+    print $fh $order;
+    close($fh);
+
+    return $OUTPUT_BASE . "/$order_id";
+}
+
+sub usage {
+    print <<END;
+$0:
+    --debug     enable debug mode
+    --help|-h   this help
+END
+    exit;
+}
+
+
+main;
