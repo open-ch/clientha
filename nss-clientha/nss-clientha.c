@@ -5,6 +5,8 @@
  * Copyright (c) 2013 Open Systems AG, Switzerland
  * All Rights Reserved.
  *
+ * Based on 'nss-myhostname' by Lennart Poettering
+ *
  * LICENSE:
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by the
