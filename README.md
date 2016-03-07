@@ -2,7 +2,7 @@
 
 ClientHA - a Linux NSS Module for Client-Side High Availability Failover
 
-Written by Jan Bernegger jab@open.ch, November 2013
+Written by Jan Bernegger, November 2013
 Copyright (c) 2013-2016 Open Systems AG, Switzerland
 All Rights Reserved.
 
